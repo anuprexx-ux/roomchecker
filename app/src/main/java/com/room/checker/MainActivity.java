@@ -1,6 +1,7 @@
 package com.room.checker;
 
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -20,6 +21,7 @@ import android.widget.Toast;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.Text;
 import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.util.ArrayList;
@@ -32,6 +34,9 @@ public class MainActivity extends Activity {
     private static final int REQ_IMAGE = 102;
     private EditText input;
     private TextView status;
+    private TextRecognizer recognizer;
+    private int pending = 0;
+    private List<String> collected = new ArrayList<>();
 
     static class Item {
         int top;
@@ -41,6 +46,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
         int p = (int) (16 * getResources().getDisplayMetrics().density);
 
         LinearLayout root = new LinearLayout(this);
@@ -65,11 +71,13 @@ public class MainActivity extends Activity {
         root.addView(status);
 
         Button img = new Button(this);
-        img.setText("Screenshot se list banao");
+        img.setText("Screenshots se list banao (4-5 ek saath)");
         img.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("image/*");
-            startActivityForResult(Intent.createChooser(i, "Screenshot chuno"), REQ_IMAGE);
+            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            startActivityForResult(i, REQ_IMAGE);
         });
         root.addView(img);
 
@@ -121,32 +129,57 @@ public class MainActivity extends Activity {
         Toast.makeText(this, "List save: " + countNames() + " players", Toast.LENGTH_SHORT).show();
     }
 
-    private void readListFromImage(Uri uri) {
-        try {
-            InputImage image = InputImage.fromFilePath(this, uri);
-            Toast.makeText(this, "Screenshot padh raha hoon...", Toast.LENGTH_SHORT).show();
-            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                    .process(image)
-                    .addOnSuccessListener(text -> addNames(text))
-                    .addOnFailureListener(e ->
-                            Toast.makeText(this, "Screenshot padh nahi paya", Toast.LENGTH_LONG).show());
-        } catch (Exception e) {
-            Toast.makeText(this, "Screenshot khul nahi paya", Toast.LENGTH_LONG).show();
+    private void readImages(List<Uri> uris) {
+        pending = uris.size();
+        collected = new ArrayList<>();
+        Toast.makeText(this, uris.size() + " screenshot padh raha hoon...", Toast.LENGTH_SHORT).show();
+        for (Uri u : uris) {
+            try {
+                InputImage image = InputImage.fromFilePath(this, u);
+                final int h = image.getHeight();
+                recognizer.process(image)
+                        .addOnSuccessListener(text -> {
+                            collectNames(text, h);
+                            oneDone();
+                        })
+                        .addOnFailureListener(e -> oneDone());
+            } catch (Exception e) {
+                oneDone();
+            }
         }
     }
 
-    private void addNames(Text text) {
+    private void oneDone() {
+        pending--;
+        if (pending == 0) finishImport();
+    }
+
+    private String clean(String raw) {
+        String s = raw.trim();
+        String low = s.toLowerCase();
+        if (low.matches(".*\\d{1,2}:\\d{2}.*")) return null;
+        if (low.contains("match details") || low.contains("entry fee") || low.startsWith("join")) return null;
+        s = s.replaceFirst("^\\d{1,2}\\s*[.)\\-:]\\s*", "");
+        s = s.replaceFirst("^\\d{1,2}\\s+(?=[^\\d\\s])", "");
+        s = s.trim();
+        if (s.matches("^\\d{1,2}$")) return null;
+        int cnt = 0;
+        for (char ch : s.toCharArray()) {
+            if (Character.isLetterOrDigit(ch)) cnt++;
+        }
+        if (cnt < 2) return null;
+        return s;
+    }
+
+    private void collectNames(Text text, int h) {
         List<Item> items = new ArrayList<>();
         for (Text.TextBlock blk : text.getTextBlocks()) {
             for (Text.Line l : blk.getLines()) {
                 Rect r = l.getBoundingBox();
-                String s = l.getText().trim();
                 if (r == null) continue;
-                int letters = 0;
-                for (char ch : s.toCharArray()) {
-                    if (Character.isLetter(ch)) letters++;
-                }
-                if (letters < 2) continue;
+                if (r.top < h * 0.095 || r.bottom > h * 0.875) continue;
+                String s = clean(l.getText());
+                if (s == null) continue;
                 Item it = new Item();
                 it.top = r.top;
                 it.s = s;
@@ -154,15 +187,18 @@ public class MainActivity extends Activity {
             }
         }
         Collections.sort(items, (x, y) -> Integer.compare(x.top, y.top));
+        for (Item it : items) collected.add(it.s);
+    }
 
-        String old = input.getText().toString();
-        StringBuilder sb = new StringBuilder(old);
-        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') sb.append('\n');
-        String seen = "\n" + old + "\n";
-        for (Item it : items) {
-            if (seen.contains("\n" + it.s + "\n")) continue;
-            sb.append(it.s).append('\n');
-            seen += it.s + "\n";
+    private void finishImport() {
+        List<String> keys = new ArrayList<>();
+        StringBuilder sb = new StringBuilder();
+        for (String s : collected) {
+            String k = CheckerService.norm(s);
+            String key = k.length() > 0 ? k : "raw:" + s;
+            if (keys.contains(key)) continue;
+            keys.add(key);
+            sb.append(s).append('\n');
         }
         input.setText(sb.toString());
         saveList();
@@ -184,8 +220,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_IMAGE && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            readListFromImage(data.getData());
+        if (requestCode == REQ_IMAGE && resultCode == RESULT_OK && data != null) {
+            List<Uri> uris = new ArrayList<>();
+            ClipData cd = data.getClipData();
+            if (cd != null) {
+                for (int i = 0; i < cd.getItemCount(); i++) uris.add(cd.getItemAt(i).getUri());
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+            if (!uris.isEmpty()) readImages(uris);
             return;
         }
         if (requestCode == REQ_CAPTURE && resultCode == RESULT_OK && data != null) {
