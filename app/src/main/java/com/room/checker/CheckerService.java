@@ -248,6 +248,20 @@ public class CheckerService extends Service {
                 .addOnFailureListener(e -> finishScan("Text padh nahi paya"));
     }
 
+    private static boolean hasLetter(String s) {
+        for (char ch : s.toCharArray()) {
+            if (Character.isLetter(ch)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasDigit(String s) {
+        for (char ch : s.toCharArray()) {
+            if (Character.isDigit(ch)) return true;
+        }
+        return false;
+    }
+
     private void showResult(Text text, int w, int h) {
         SharedPreferences sp = getSharedPreferences("rc", MODE_PRIVATE);
         List<String> reg = new ArrayList<>();
@@ -260,14 +274,24 @@ public class CheckerService extends Service {
         List<Rect> boxes = new ArrayList<>();
         List<Integer> cls = new ArrayList<>();
         List<Integer> best = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
 
         for (Text.TextBlock b : text.getTextBlocks()) {
             for (Text.Line l : b.getLines()) {
                 Rect box = l.getBoundingBox();
                 if (box == null) continue;
-                String raw = l.getText().replace("...", "").replace("\u2026", "");
+                String raw = l.getText().replace("...", "").replace("\u2026", "").trim();
+                if (!hasLetter(raw) && hasDigit(raw)) continue;
                 String n = norm(raw);
-                if (n.length() < 3) continue;
+                if (n.length() < 3) {
+                    if (n.length() == 0 && raw.length() >= 2 && !hasDigit(raw)) {
+                        boxes.add(box);
+                        cls.add(1);
+                        best.add(-1);
+                        labels.add(raw);
+                    }
+                    continue;
+                }
                 double top = 0;
                 int idx = -1;
                 for (int i = 0; i < reg.size(); i++) {
@@ -277,10 +301,11 @@ public class CheckerService extends Service {
                         idx = i;
                     }
                 }
-                int c = top >= 0.72 ? 0 : (top >= 0.55 ? 1 : 2);
+                int c = top >= 0.72 ? 0 : (top >= 0.40 ? 1 : 2);
                 boxes.add(box);
                 cls.add(c);
                 best.add(c == 0 ? idx : -1);
+                labels.add(raw);
             }
         }
 
@@ -300,10 +325,10 @@ public class CheckerService extends Service {
             else if (c == 1) y++;
             else r++;
         }
-        String summary = "Unregistered: " + r + "   Check: " + y + "   OK: " + g;
+        String summary = "Unreg: " + r + "   Check: " + y + "   OK: " + g + "   Total: " + cls.size();
 
         clearResult();
-        resultView = new ResultView(this, boxes, cls, summary);
+        resultView = new ResultView(this, boxes, cls, labels, summary);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(w, h,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -352,7 +377,11 @@ public class CheckerService extends Service {
     static double sim(String a, String b) {
         int la = a.length(), lb = b.length();
         int mn = Math.min(la, lb);
-        if (mn >= 3 && (a.contains(b) || b.contains(a))) return 1.0;
+        int mx = Math.max(la, lb);
+        if (a.equals(b)) return 1.0;
+        if (mn >= 4 && (a.contains(b) || b.contains(a))) {
+            return mn * 2 >= mx ? 1.0 : 0.7;
+        }
         int[] prev = new int[lb + 1];
         int[] cur = new int[lb + 1];
         for (int j = 0; j <= lb; j++) prev[j] = j;
@@ -366,7 +395,7 @@ public class CheckerService extends Service {
             prev = cur;
             cur = t;
         }
-        return 1.0 - (double) prev[lb] / Math.max(la, lb);
+        return 1.0 - (double) prev[lb] / mx;
     }
 
     @Override
@@ -387,22 +416,27 @@ public class CheckerService extends Service {
     static class ResultView extends View {
         final List<Rect> boxes;
         final List<Integer> cls;
+        final List<String> labels;
         final String summary;
         final Paint fill = new Paint();
         final Paint stroke = new Paint();
         final Paint txt = new Paint();
+        final Paint small = new Paint();
         final Paint bg = new Paint();
 
-        ResultView(Context c, List<Rect> b, List<Integer> k, String s) {
+        ResultView(Context c, List<Rect> b, List<Integer> k, List<String> lb, String s) {
             super(c);
             boxes = b;
             cls = k;
+            labels = lb;
             summary = s;
             stroke.setStyle(Paint.Style.STROKE);
             stroke.setStrokeWidth(5f);
             txt.setColor(Color.WHITE);
             txt.setTextSize(42f);
             txt.setFakeBoldText(true);
+            small.setColor(Color.WHITE);
+            small.setTextSize(30f);
             bg.setColor(0xCC000000);
         }
 
@@ -410,12 +444,21 @@ public class CheckerService extends Service {
         protected void onDraw(Canvas canvas) {
             for (int i = 0; i < boxes.size(); i++) {
                 int c = cls.get(i);
+                Rect box = boxes.get(i);
                 int col = c == 0 ? 0xFF00C853 : (c == 1 ? 0xFFFFC107 : 0xFFFF1744);
                 fill.setColor(col);
                 fill.setAlpha(c == 2 ? 90 : 35);
                 stroke.setColor(col);
-                canvas.drawRect(boxes.get(i), fill);
-                canvas.drawRect(boxes.get(i), stroke);
+                canvas.drawRect(box, fill);
+                canvas.drawRect(box, stroke);
+                if (c != 0) {
+                    String lab = labels.get(i);
+                    float tw = small.measureText(lab);
+                    float x = box.left;
+                    float y = Math.max(box.top - 8, 110);
+                    canvas.drawRect(x, y - 30, x + tw + 10, y + 8, bg);
+                    canvas.drawText(lab, x + 5, y, small);
+                }
             }
             canvas.drawRect(0, 0, txt.measureText(summary) + 40, 70, bg);
             canvas.drawText(summary, 20, 52, txt);
